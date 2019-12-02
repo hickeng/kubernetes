@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -37,6 +38,59 @@ const (
 	defaultKeepAlivePeriod = 3 * time.Minute
 )
 
+// GetCertificate returns the best certificate for the given ClientHelloInfo,
+// defaulting to the first element of c.Certificates.
+// This is based on https://golang.org/src/crypto/tls/common.go getCertificate function
+// however it is extended to serve differentiated certificates based on incoming IP.
+// This duplicates that function because it's necessary to unset c.Certificates in order
+// to activate this callback even in non-SNI path, so the fallthrough handling will not
+// suffice.
+func (s *SecureServingInfo) GetCertificate (clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+
+	if len(s.SNICerts) == 0 && len(s.FilteredCerts) == 0 {
+		if s.Cert == nil {
+			return nil, errors.New("tls: no certificates configured")
+		}
+
+		return s.Cert, nil
+	}
+
+	if len(clientHello.ServerName) > 0 {
+		name := strings.ToLower(clientHello.ServerName)
+		for len(name) > 0 && name[len(name)-1] == '.' {
+			name = name[:len(name)-1]
+		}
+
+		if cert, ok := s.SNICerts[name]; ok {
+			return cert, nil
+		}
+
+		// try replacing labels in the name with wildcards until we get a
+		// match.
+		labels := strings.Split(name, ".")
+		for i := range labels {
+			labels[i] = "*"
+			candidate := strings.Join(labels, ".")
+			if cert, ok := s.SNICerts[candidate]; ok {
+				return cert, nil
+			}
+		}
+	}
+
+	// determine if there is a cert configured that matches the rich filters
+	for _, filter := range s.FilteredCerts {
+		klog.V(3).Infof("Checking for filtered cert with %v and %v", clientHello.Conn.LocalAddr(), clientHello.Conn.RemoteAddr())
+
+		cert := filter(clientHello)
+		if cert != nil {
+			return cert, nil
+		}
+	}
+
+	// If nothing matches, return the first certificate.
+	return s.Cert, nil
+}
+
 // Serve runs the secure http server. It fails only if certificates cannot be loaded or the initial listen call fails.
 // The actual server loop (stoppable by closing stopCh) runs in a go routine, i.e. Serve does not block.
 // It returns a stoppedCh that is closed when all non-hijacked active requests have been processed.
@@ -50,7 +104,9 @@ func (s *SecureServingInfo) Serve(handler http.Handler, shutdownTimeout time.Dur
 		Handler:        handler,
 		MaxHeaderBytes: 1 << 20,
 		TLSConfig: &tls.Config{
+			Certificates:      nil,
 			NameToCertificate: s.SNICerts,
+			GetCertificate:    s.GetCertificate,
 			// Can't use SSLv3 because of POODLE and BEAST
 			// Can't use TLSv1.0 because of POODLE and BEAST using CBC cipher
 			// Can't use TLSv1.1 because of RC4 cipher usage
@@ -70,18 +126,6 @@ func (s *SecureServingInfo) Serve(handler http.Handler, shutdownTimeout time.Dur
 	}
 	if len(s.CipherSuites) > 0 {
 		secureServer.TLSConfig.CipherSuites = s.CipherSuites
-	}
-
-	if s.Cert != nil {
-		secureServer.TLSConfig.Certificates = []tls.Certificate{*s.Cert}
-	}
-
-	// append all named certs. Otherwise, the go tls stack will think no SNI processing
-	// is necessary because there is only one cert anyway.
-	// Moreover, if ServerCert.CertFile/ServerCert.KeyFile are not set, the first SNI
-	// cert will become the default cert. That's what we expect anyway.
-	for _, c := range s.SNICerts {
-		secureServer.TLSConfig.Certificates = append(secureServer.TLSConfig.Certificates, *c)
 	}
 
 	if s.ClientCA != nil {
@@ -181,6 +225,141 @@ type NamedTLSCert struct {
 	Names []string
 }
 
+type FilteredTLSCert struct {
+	TLSCert tls.Certificate
+
+	Enabled        bool
+	Interfaces     []*net.Interface
+	ExcludeSrcCIDR []*net.IPNet
+	RequireSrcCIDR []*net.IPNet
+}
+
+func NewCertFilter(cert *tls.Certificate, filters map[string][]string) (*FilteredTLSCert, error) {
+	f := &FilteredTLSCert{
+		TLSCert: *cert,
+		Enabled: true,
+	}
+
+	for name, detail := range filters {
+		switch name {
+		case "interface":
+			softFail := false
+			for _, n := range detail {
+				itf, err := net.InterfaceByName(strings.TrimSpace(n))
+				if err != nil {
+					// soft failure to allow for hotadd/heterogeneous topologies but we still require
+					// a restart to pick up the new interface
+					klog.Warningf("Unable to locate interface specified in filter: %s", n)
+					softFail = true
+					continue
+				}
+
+				f.Interfaces = append(f.Interfaces, itf)
+			}
+
+			// if interface filters were specified but none could be found then this filter needs to
+			// be disabled or it will present as one without any interface restrictions and will
+			// therefore match much more widely than is desirable.
+			if softFail && len(f.Interfaces) == 0 {
+				f.Enabled = false
+			}
+
+		case "exclude-src-cidr":
+			for _, n := range detail {
+				_, cidr, err := net.ParseCIDR(strings.TrimSpace(n))
+				if err != nil {
+					return nil, fmt.Errorf("unable to parse CIDR specified in filter: %v", )
+				}
+
+				f.ExcludeSrcCIDR = append(f.ExcludeSrcCIDR, cidr)
+			}
+
+		case "require-src-cidr":
+			for _, n := range detail {
+				_, cidr, err := net.ParseCIDR(strings.TrimSpace(n))
+				if err != nil {
+					return nil, fmt.Errorf("unable to parse CIDR specified in filter: %v", )
+				}
+
+				f.RequireSrcCIDR = append(f.RequireSrcCIDR, cidr)
+			}
+
+		default:
+			return nil, fmt.Errorf("unknown filter type for selecting certificates: %s", name)
+		}
+	}
+
+	return f, nil
+}
+
+// FilterFn returns a filter function that will return a certificate if the connection information
+// supplied matches the filter conditions.
+// This may return nil if the filter is disabled.
+func (f *FilteredTLSCert) FilterFn() CertFilterFn {
+	if !f.Enabled {
+		return nil
+	}
+
+	return func(clientHello *tls.ClientHelloInfo) *tls.Certificate {
+		laddr, lok := clientHello.Conn.LocalAddr().(*net.TCPAddr)
+		raddr, rok := clientHello.Conn.RemoteAddr().(*net.TCPAddr)
+		if !lok || !rok {
+			return nil
+		}
+
+		if len(f.RequireSrcCIDR) != 0 {
+			match := false
+			for _, cidr := range f.RequireSrcCIDR {
+				if cidr.Contains(raddr.IP) {
+					match = true
+					break
+				}
+			}
+
+			if !match {
+				klog.V(3).Infof("Rejected use of cert as %s is not in required source CIDRs", raddr.IP.String())
+				return nil
+			}
+		}
+
+		for _, cidr := range f.ExcludeSrcCIDR {
+			if cidr.Contains(raddr.IP) {
+				klog.V(3).Infof("Rejected use of cert as %s contains %s", cidr.String(), raddr.IP.String())
+				return nil
+			}
+		}
+
+		if len(f.Interfaces) == 0 {
+			return &f.TLSCert
+		}
+
+		for _, intf := range f.Interfaces {
+			addrs, err := intf.Addrs()
+			if err != nil {
+				klog.Errorf("Unable to retrieve addresses assocaited with interface %s for serving filtered certificate: %v", err)
+				return nil
+			}
+
+			for i := range addrs {
+				addr, ok := addrs[i].(*net.IPNet)
+				if !ok {
+					klog.Warning("Unexpected address type on interface during certificate filtering: %T %v", addrs[i], addrs[i])
+					continue
+				}
+
+				if !addr.IP.Equal(laddr.IP) {
+					klog.V(3).Infof("Discarding interface address that does not match conn info: %s != %s", addr.IP, laddr.IP)
+					continue
+				}
+
+				return &f.TLSCert
+			}
+		}
+
+		return nil
+	}
+}
+
 // GetNamedCertificateMap returns a map of *tls.Certificate by name. It's
 // suitable for use in tls.Config#NamedCertificates. Returns an error if any of the certs
 // cannot be loaded. Returns nil if len(certs) == 0
@@ -223,6 +402,7 @@ func GetNamedCertificateMap(certs []NamedTLSCert) (map[string]*tls.Certificate, 
 
 	return byName, nil
 }
+
 
 // tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
 // connections. It's used by ListenAndServe and ListenAndServeTLS so

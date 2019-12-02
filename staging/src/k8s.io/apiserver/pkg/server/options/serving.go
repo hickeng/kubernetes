@@ -56,6 +56,10 @@ type SecureServingOptions struct {
 	ServerCert GeneratableKeyCert
 	// SNICertKeys are named CertKeys for serving secure traffic with SNI support.
 	SNICertKeys []cliflag.NamedCertKey
+	// FilterCertKeys are CertKeys for serving secure traffic with specific certificates for specific
+	// connections.
+	FilterCertKeys []cliflag.FilterCertKey
+
 	// CipherSuites is the list of allowed cipher suites for the server.
 	// Values are from tls package constants (https://golang.org/pkg/crypto/tls/#pkg-constants).
 	CipherSuites []string
@@ -186,6 +190,14 @@ func (s *SecureServingOptions) AddFlags(fs *pflag.FlagSet) {
 		"--tls-sni-cert-key multiple times. "+
 		"Examples: \"example.crt,example.key\" or \"foo.crt,foo.key:*.foo.com,foo.com\".")
 
+	fs.Var(cliflag.NewFilterCertKeyArray(&s.FilterCertKeys), "tls-filter-cert-key", ""+
+		"A pair of x509 certificate and private key file paths, suffixed with a list of filters to"+
+		"restrict when a given certificate will be used. Filters take the form of name=details with"+
+		"multiple filters being separated by commas. For multiple key/certificate pairs, use the "+
+		"--tls-filter-cert-key multiple times. "+
+		"Examples: \"example.crt,example.key:interface=eth1\" or " +
+		"\"foo.crt,foo.key:include-src-cidr=10.0.0.0/8,exclude-src-cidr=10.240.0.0/16+10.280.0.0/16\".")
+
 	fs.IntVar(&s.HTTP2MaxStreamsPerConnection, "http2-max-streams-per-connection", s.HTTP2MaxStreamsPerConnection, ""+
 		"The limit that the server gives to clients for "+
 		"the maximum number of streams in an HTTP/2 connection. "+
@@ -260,9 +272,29 @@ func (s *SecureServingOptions) ApplyTo(config **server.SecureServingInfo) error 
 			return fmt.Errorf("failed to load SNI cert and key: %v", err)
 		}
 	}
+
 	c.SNICerts, err = server.GetNamedCertificateMap(namedTLSCerts)
 	if err != nil {
 		return err
+	}
+
+	// load filtered certs
+	for _, fck := range s.FilterCertKeys {
+		tlsCert, err := tls.LoadX509KeyPair(fck.CertFile, fck.KeyFile)
+		if err != nil {
+			return fmt.Errorf("failed to load SNI cert and key: %v", err)
+		}
+
+		fc, err := server.NewCertFilter(&tlsCert, fck.Filters)
+		if err != nil {
+			return fmt.Errorf("failed construct cert filter: %v", err)
+		}
+
+		fn := fc.FilterFn()
+		if fn != nil {
+			c.FilteredCerts = append(c.FilteredCerts, fn)
+			klog.V(1).Infof("Installed certificate filter: %s", fck.String())
+		}
 	}
 
 	return nil

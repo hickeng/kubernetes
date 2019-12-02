@@ -225,6 +225,9 @@ type RecommendedConfig struct {
 	ClientConfig *restclient.Config
 }
 
+// CertFilterFn takes a tls.ClientHelloInfo and returns a certificate to use, or nil if no certificate matches.
+type CertFilterFn func(*tls.ClientHelloInfo) (*tls.Certificate)
+
 type SecureServingInfo struct {
 	// Listener is the secure server network listener.
 	Listener net.Listener
@@ -235,6 +238,10 @@ type SecureServingInfo struct {
 
 	// SNICerts are the TLS certificates by name used for SNI.
 	SNICerts map[string]*tls.Certificate
+
+	// FilteredCerts is a set of functions to be called that will return a Certificate if the parameter
+	// matches the filter criteria, otherwise returning nil.
+	FilteredCerts []CertFilterFn
 
 	// ClientCA is the certificate bundle for all the signers that you'll recognize for incoming client certificates
 	ClientCA *x509.CertPool
