@@ -305,7 +305,13 @@ func (c *Client) AddMember(name string, peerAddrs string) ([]Member, error) {
 	for _, m := range resp.Members {
 		// fixes the entry for the joining member (that doesn't have a name set in the initialCluster returned by etcd)
 		if m.Name == "" {
-			ret = append(ret, Member{Name: name, PeerURL: m.PeerURLs[0]})
+			if m.PeerURLs[0] == peerAddrs {
+				// This is the local member, so insert the provided name
+				ret = append(ret, Member{Name: name, PeerURL: m.PeerURLs[0]})
+			} else {
+				// This is another member because peerAddrs do not match, give the etcd ID as Name
+				ret = append(ret, Member{Name: strconv.FormatUint(m.ID, 16), PeerURL: m.PeerURLs[0]})
+			}
 		} else {
 			ret = append(ret, Member{Name: m.Name, PeerURL: m.PeerURLs[0]})
 		}
