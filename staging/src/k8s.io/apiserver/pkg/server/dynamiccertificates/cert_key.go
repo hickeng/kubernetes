@@ -18,6 +18,7 @@ package dynamiccertificates
 
 import (
 	"bytes"
+	"crypto/tls"
 )
 
 // CertKeyContentProvider provides a certificate and matching private key
@@ -35,10 +36,20 @@ type SNICertKeyContentProvider interface {
 	SNINames() []string
 }
 
+// FilterCertKeyContentProvider provides a certificate and matching private key as well as a filter set.
+type FilterCertKeyContentProvider interface {
+	CertKeyContentProvider
+	// Filter returns a function taking a ClientHelloInfo struct and returning true/false for if this cert matches the connection.
+	Filter() CertFilterFn
+	// Description returns a normalized string form of the filters used.
+	Description() string
+}
+
 // certKeyContent holds the content for the cert and key
 type certKeyContent struct {
-	cert []byte
-	key  []byte
+	cert      []byte
+	key       []byte
+	processed *tls.Certificate
 }
 
 func (c *certKeyContent) Equal(rhs *certKeyContent) bool {
@@ -68,6 +79,25 @@ func (c *sniCertKeyContent) Equal(rhs *sniCertKeyContent) bool {
 		if c.sniNames[i] != rhs.sniNames[i] {
 			return false
 		}
+	}
+
+	return c.certKeyContent.Equal(&rhs.certKeyContent)
+}
+
+// filterCertKeyContent holds the content for the cert and key as well a matching function
+type filterCertKeyContent struct {
+	certKeyContent
+	filter      CertFilterFn
+	description string
+}
+
+func (c *filterCertKeyContent) Equal(rhs *filterCertKeyContent) bool {
+	if c == nil || rhs == nil {
+		return c == rhs
+	}
+
+	if c.description != rhs.description {
+		return false
 	}
 
 	return c.certKeyContent.Equal(&rhs.certKeyContent)

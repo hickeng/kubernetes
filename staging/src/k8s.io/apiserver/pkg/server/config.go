@@ -237,6 +237,10 @@ type SecureServingInfo struct {
 	// SNICerts are the TLS certificates used for SNI.
 	SNICerts []dynamiccertificates.SNICertKeyContentProvider
 
+	// FilterCerts is a set of functions to be called that will return a Certificate if the parameter
+	// matches the filter criteria, otherwise returning nil.
+	FilterCerts []dynamiccertificates.FilterCertKeyContentProvider
+
 	// ClientCA is the certificate bundle for all the signers that you'll recognize for incoming client certificates
 	ClientCA dynamiccertificates.CAContentProvider
 

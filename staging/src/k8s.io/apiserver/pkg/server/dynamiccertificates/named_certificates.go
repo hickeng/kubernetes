@@ -41,6 +41,8 @@ func (c *DynamicServingCertificateController) BuildNamedCertificates(sniCerts []
 			return nil, fmt.Errorf("invalid SNI cert keypair [%d/%q]: %v", i, c.sniCerts[i].Name(), err)
 		}
 
+		sniCerts[i].processed = &cert
+
 		// error is not possible given above call to X509KeyPair
 		x509Cert, _ := x509.ParseCertificate(cert.Certificate[0])
 

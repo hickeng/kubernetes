@@ -129,6 +129,30 @@ func TestCABundleContentEquals(t *testing.T) {
 			expected: false,
 		},
 		{
+			name:     "both bundle nil",
+			lhs:      &caBundleContent{caBundle: nil},
+			rhs:      &caBundleContent{caBundle: nil},
+			expected: true,
+		},
+		{
+			name:     "rhs bundle nil",
+			lhs:      &caBundleContent{caBundle: []byte("foo")},
+			rhs:      &caBundleContent{caBundle: nil},
+			expected: false,
+		},
+		{
+			name:     "lhs bundle empty",
+			lhs:      &caBundleContent{caBundle: []byte("")},
+			rhs:      &caBundleContent{caBundle: nil},
+			expected: true,
+		},
+		{
+			name:     "lhs bundle nil",
+			lhs:      &caBundleContent{caBundle: nil},
+			rhs:      &caBundleContent{caBundle: []byte("foo")},
+			expected: false,
+		},
+		{
 			name:     "same",
 			lhs:      &caBundleContent{caBundle: []byte("foo")},
 			rhs:      &caBundleContent{caBundle: []byte("foo")},

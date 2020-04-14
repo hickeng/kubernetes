@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,9 @@ type DynamicServingCertificateController struct {
 	servingCert CertKeyContentProvider
 	// sniCerts are a list of CertKeyContentProvider with associated names used for SNI
 	sniCerts []SNICertKeyContentProvider
+	// filteredCerts is a set of functions to be called that will return a Certificate if the parameter
+	// matches the filter criteria, otherwise returning nil.
+	filterCerts []FilterCertKeyContentProvider
 
 	// currentlyServedContent holds the original bytes that we are serving. This is used to decide if we need to set a
 	// new atomic value. The types used for efficient TLSConfig preclude using the processed value.
@@ -68,6 +72,7 @@ func NewDynamicServingCertificateController(
 	clientCA CAContentProvider,
 	servingCert CertKeyContentProvider,
 	sniCerts []SNICertKeyContentProvider,
+	filteredCerts []FilterCertKeyContentProvider,
 	eventRecorder events.EventRecorder,
 ) *DynamicServingCertificateController {
 	c := &DynamicServingCertificateController{
@@ -75,6 +80,7 @@ func NewDynamicServingCertificateController(
 		clientCA:      clientCA,
 		servingCert:   servingCert,
 		sniCerts:      sniCerts,
+		filterCerts:   filteredCerts,
 
 		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "DynamicServingCertificateController"),
 		eventRecorder: eventRecorder,
@@ -127,6 +133,19 @@ func (c *DynamicServingCertificateController) newTLSContent() (*dynamicCertifica
 		newContent.sniCerts = append(newContent.sniCerts, sniCertKeyContent{certKeyContent: certKeyContent{cert: currCert, key: currKey}, sniNames: sniCert.SNINames()})
 	}
 
+	for i, filterCert := range c.filterCerts {
+		currCert, currKey := filterCert.CurrentCertKeyContent()
+		if len(currCert) == 0 || len(currKey) == 0 {
+			return nil, fmt.Errorf("not loading an empty filter certificate from %d/%q", i, filterCert.Name())
+		}
+
+		newContent.filterCerts = append(newContent.filterCerts, filterCertKeyContent{
+			certKeyContent: certKeyContent{cert: currCert, key: currKey},
+			filter:         filterCert.Filter(),
+			description:    filterCert.Description(),
+		})
+	}
+
 	return newContent, nil
 }
 
@@ -163,6 +182,7 @@ func (c *DynamicServingCertificateController) syncCerts() error {
 		}
 
 		newTLSConfigCopy.ClientCAs = newClientCAPool
+		newContent.clientCA.processed = newClientCAPool
 	}
 
 	if len(newContent.servingCert.cert) > 0 && len(newContent.servingCert.key) > 0 {
@@ -178,10 +198,11 @@ func (c *DynamicServingCertificateController) syncCerts() error {
 
 		klog.V(2).Infof("loaded serving cert [%q]: %s", c.servingCert.Name(), GetHumanCertDetail(x509Cert))
 		if c.eventRecorder != nil {
-			c.eventRecorder.Eventf(nil, nil, v1.EventTypeWarning, "TLSConfigChanged", "ServingCertificateReload", "loaded serving cert [%q]: %s", c.clientCA.Name(), GetHumanCertDetail(x509Cert))
+			c.eventRecorder.Eventf(nil, nil, v1.EventTypeWarning, "TLSConfigChanged", "ServingCertificateReload", "loaded serving cert [%q]: %s", c.servingCert.Name(), GetHumanCertDetail(x509Cert))
 		}
 
 		newTLSConfigCopy.Certificates = []tls.Certificate{cert}
+		newContent.servingCert.processed = &cert
 	}
 
 	if len(newContent.sniCerts) > 0 {
@@ -189,19 +210,103 @@ func (c *DynamicServingCertificateController) syncCerts() error {
 		if err != nil {
 			return fmt.Errorf("unable to build named certificate map: %v", err)
 		}
+	}
 
-		// append all named certs. Otherwise, the go tls stack will think no SNI processing
-		// is necessary because there is only one cert anyway.
-		// Moreover, if servingCert is not set, the first SNI
-		// cert will become the default cert. That's what we expect anyway.
-		for _, sniCert := range newTLSConfigCopy.NameToCertificate {
-			newTLSConfigCopy.Certificates = append(newTLSConfigCopy.Certificates, *sniCert)
+	for i := range newContent.filterCerts {
+		cert, err := tls.X509KeyPair(newContent.filterCerts[i].cert, newContent.filterCerts[i].key)
+		if err != nil {
+			return fmt.Errorf("invalid filter cert keypair [%d/%q]: %v", i, c.filterCerts[i].Name(), err)
 		}
+
+		// error isn't possible given above call
+		x509Cert, _ := x509.ParseCertificate(cert.Certificate[0])
+		klog.V(2).Infof("loaded filter cert [%q] [%q]: %s", c.filterCerts[i].Name(), c.filterCerts[i].Description(), GetHumanCertDetail(x509Cert))
+		if c.eventRecorder != nil {
+			c.eventRecorder.Eventf(nil, nil, v1.EventTypeWarning, "TLSConfigChanged", "FilteredCertificateReload", "loaded filtered cert [%q] [%q]: %s", c.filterCerts[i].Name(), c.filterCerts[i].Description(), GetHumanCertDetail(x509Cert))
+		}
+
+		newContent.filterCerts[i].processed = &cert
+	}
+
+	// install the GetCertificate callback to handle SNI and filtered certs
+	err = c.installGetCertificateHandler(newTLSConfigCopy, newContent.filterCerts)
+	if err != nil {
+		return fmt.Errorf("unable to install get certificate handler for filter cert support: %v", err)
 	}
 
 	// store new values of content for serving.
 	c.currentServingTLSConfig.Store(newTLSConfigCopy)
 	c.currentlyServedContent = newContent // this is single threaded, so we have no locking issue
+
+	return nil
+}
+
+func (c *DynamicServingCertificateController) installGetCertificateHandler(config *tls.Config, filterCerts []filterCertKeyContent) error {
+	var cert *tls.Certificate
+	if len(config.Certificates) > 0 {
+		cert = &config.Certificates[0]
+	}
+
+	sni := config.NameToCertificate
+
+	// need to nil these fields to get through to the GetCertificate callback
+	config.Certificates = nil
+	config.NameToCertificate = nil
+
+	// GetCertificate returns the best certificate for the given ClientHelloInfo,
+	// defaulting to the first element of c.Certificates.
+	// This is based on https://golang.org/src/crypto/tls/common.go getCertificate function
+	// however it is extended to serve differentiated certificates based on incoming IP.
+	// This duplicates that function because it's necessary to unset c.Certificates in order
+	// to activate this callback even in non-SNI path, so the fallthrough handling will not
+	// suffice.
+	config.GetCertificate = func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if len(sni) == 0 && len(filterCerts) == 0 {
+			if cert == nil {
+				return nil, errors.New("tls: no certificates configured")
+			}
+
+			return cert, nil
+		}
+
+		if len(clientHello.ServerName) > 0 {
+			name := strings.ToLower(clientHello.ServerName)
+			for len(name) > 0 && name[len(name)-1] == '.' {
+				name = name[:len(name)-1]
+			}
+
+			if cert, ok := sni[name]; ok {
+				return cert, nil
+			}
+
+			// try replacing labels in the name with wildcards until we get a
+			// match.
+			labels := strings.Split(name, ".")
+			for i := range labels {
+				labels[i] = "*"
+				candidate := strings.Join(labels, ".")
+				if cert, ok := sni[candidate]; ok {
+					return cert, nil
+				}
+			}
+		}
+
+		// determine if there is a cert configured that matches the rich filters
+		for _, filterCert := range filterCerts {
+			klog.V(3).Infof("Checking for filtered cert with %v and %v", clientHello.Conn.LocalAddr(), clientHello.Conn.RemoteAddr())
+
+			if filterCert.filter(clientHello) {
+				return filterCert.processed, nil
+			}
+		}
+
+		// If nothing matches, return the first certificate.
+		if cert == nil {
+			return nil, errors.New("tls: no fallback certificate configured")
+		}
+
+		return cert, nil
+	}
 
 	return nil
 }

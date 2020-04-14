@@ -70,6 +70,7 @@ func (s *SecureServingInfo) tlsConfig(stopCh <-chan struct{}) (*tls.Config, erro
 			s.ClientCA,
 			s.Cert,
 			s.SNICerts,
+			s.FilterCerts,
 			nil, // TODO see how to plumb an event recorder down in here. For now this results in simply klog messages.
 		)
 		// register if possible
@@ -108,6 +109,21 @@ func (s *SecureServingInfo) tlsConfig(stopCh <-chan struct{}) (*tls.Config, erro
 				// Files are required to be populated already, so this is for convenience.
 				if err := controller.RunOnce(); err != nil {
 					klog.Warningf("Initial population of SNI serving certificate failed: %v", err)
+				}
+
+				go controller.Run(1, stopCh)
+			}
+		}
+		for _, filterCert := range s.FilterCerts {
+			if notifier, ok := filterCert.(dynamiccertificates.Notifier); ok {
+				notifier.AddListener(dynamicCertificateController)
+			}
+
+			if controller, ok := filterCert.(dynamiccertificates.ControllerRunner); ok {
+				// runonce to try to prime data.  If this fails, it's ok because we fail closed.
+				// Files are required to be populated already, so this is for convenience.
+				if err := controller.RunOnce(); err != nil {
+					klog.Warningf("Initial population of filtered serving certificate failed: %v", err)
 				}
 
 				go controller.Run(1, stopCh)

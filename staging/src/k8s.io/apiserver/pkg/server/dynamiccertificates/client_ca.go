@@ -38,12 +38,14 @@ type dynamicCertificateContent struct {
 	clientCA    caBundleContent
 	servingCert certKeyContent
 	sniCerts    []sniCertKeyContent
+	filterCerts []filterCertKeyContent
 }
 
 // caBundleContent holds the content for the clientCA bundle.  Wrapping the bytes makes the Equals work nicely with the
 // method receiver.
 type caBundleContent struct {
-	caBundle []byte
+	caBundle  []byte
+	processed *x509.CertPool
 }
 
 func (c *dynamicCertificateContent) Equal(rhs *dynamicCertificateContent) bool {
@@ -65,6 +67,12 @@ func (c *dynamicCertificateContent) Equal(rhs *dynamicCertificateContent) bool {
 
 	for i := range c.sniCerts {
 		if !c.sniCerts[i].Equal(&rhs.sniCerts[i]) {
+			return false
+		}
+	}
+
+	for i := range c.filterCerts {
+		if !c.filterCerts[i].Equal(&rhs.filterCerts[i]) {
 			return false
 		}
 	}
